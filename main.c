@@ -1,233 +1,257 @@
-/************************************************************************/
-/* https://robotchip.ru/obzor-lcd-modulya-keypad/ - LCD Board           */
-/* https://www.goldsupplier.com/provide/p140658198.html - UIM2400X      */                                                               
-/************************************************************************/
-
-#define F_CPU 16000000UL  // Например, для 16 МГц (указывайте свою частоту!)
+#define F_CPU 16000000UL
 
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <util/delay.h>
 #include <stdio.h>
+
 /************************************************************************/
-/*          Настройка пинов                                             */
+/*          Настройка пинов LCD                                         */
 /************************************************************************/
-#define LCD_D4      PD4  // {LCD}	D4  (Data 4)
-#define LCD_D5      PD5  // {LCD}	D5  (Data 5)
-#define LCD_D6      PD6  // {LCD}	D6  (Data 6)
-#define LCD_D7      PD7  // {LCD}	D7  (Data 7)
+#define LCD_D4      PD4
+#define LCD_D5      PD5
+#define LCD_D6      PD6
+#define LCD_D7      PD7
 
-#define LCD_RS      PB0  // {LCD}	D8  (Register Select)
-#define LCD_EN      PB1  // {LCD}	D9  (Enable)
-#define LCD_LIGHT   PB2  // {LCD}	D10 (Enable) 
-//#define DIR_PIN     PB3  // {MOTOR} D11
-//#define STEP_PIN    PB4  // {MOTOR}	D12
-//#define ENA_PIN     PB5  // {MOTOR} D13
+#define LCD_RS      PB0
+#define LCD_EN      PB1
+#define LCD_LIGHT   PB2
+#define STEP_PIN    PB3
+#define DIR_PIN     PB4
+#define EN_PIN      PB5
 
-#define KEY_ADC     PC0  // Аналоговый вход A0
+#define KEY_ADC     PC0
 
+// Макросы команд LCD
+#define LCD_CLEAR         0x01
+#define LCD_RETURN_HOME   0x02
+#define LCD_DISPLAY_ON    0x0C
+#define LCD_ENTRY_MODE    0x06
+#define LCD_FUNCTION_SET  0x28
+
+#define STEPS_TO_MOVE 1000
+#define MIN_DELAY 100
+#define MAX_DELAY 800
 
 char buffer[10];
-
-
-void adc_init();//Инициализация ADC
-uint16_t adc_read(uint8_t channel);//Чтение ADC, для определения нажатой кнопки
-uint8_t read_key();//Распознование нажатой кнопки
-uint8_t debounced_read_key();//Антидребезг и обработка длинных нажатий
-void lcd_strobe();//Быстрый импульс на EN
-void lcd_send_nibble(uint8_t data);//Отправка 4 бит (ниббла)
-void lcd_command(uint8_t cmd);//Отправка команды (RS = 0)
-void lcd_data(uint8_t data);//Отправка данных (RS = 1)
-void lcd_init();//Инициализация LCD
-void lcd_print(const char *str);//Вывод строки
-char* int_to_str(int32_t num);//
-
-
-
-
-
+volatile uint16_t steps_remaining = 0;
+volatile uint8_t step_dir = 0;
+volatile uint16_t step_delay = MAX_DELAY;
 
 /************************************************************************/
-/*			Инициализация ADC                                           */
+/*          Прототипы функций                                           */
 /************************************************************************/
-void adc_init()
-{
-	ADMUX = (1 << REFS0);               // Опорное напряжение AVcc
-	ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1);  // Делитель 64 (~125 кГц)
+void adc_init();
+uint16_t adc_read(uint8_t channel);
+uint8_t read_key();
+uint8_t debounced_read_key();
+void lcd_strobe();
+void lcd_send_nibble(uint8_t data);
+void lcd_command(uint8_t cmd);
+void lcd_data(uint8_t data);
+void lcd_init();
+void lcd_print(const char *str);
+char* int_to_str(int32_t num);
+void lcd_backlight(uint8_t on);
+
+void timer1_init() {
+	TCCR1B |= (1 << WGM12);
+	TIMSK1 |= (1 << OCIE1A);
+	OCR1A = ((F_CPU / 8) / (1000000 / step_delay)) - 1;
+	TCCR1B |= (1 << CS11);
+}
+
+ISR(TIMER1_COMPA_vect) {
+	if (steps_remaining > 0) {
+		if (step_dir)
+		PORTB |= (1 << DIR_PIN);
+		else
+		PORTB &= ~(1 << DIR_PIN);
+
+		PORTB |= (1 << STEP_PIN);
+		for (volatile uint8_t i = 0; i < 20; i++) __asm__ __volatile__("nop");
+		PORTB &= ~(1 << STEP_PIN);
+
+		steps_remaining--;
+
+		if (steps_remaining > 0) {
+			if (step_delay > MIN_DELAY && steps_remaining > 50) {
+				step_delay -= 5;
+				} else if (steps_remaining < 50 && step_delay < MAX_DELAY) {
+				step_delay += 5;
+			}
+			OCR1A = ((F_CPU / 8) / (1000000 / step_delay)) - 1;
+		}
+	}
+}
+
+void stepper_start_move(uint16_t steps, uint8_t dir) {
+	step_dir = dir;
+	steps_remaining = steps;
+	step_delay = MAX_DELAY;
+	OCR1A = ((F_CPU / 8) / (1000000 / step_delay)) - 1;
+}
+
+void stepper_init() {
+	DDRB |= (1 << STEP_PIN) | (1 << DIR_PIN) | (1 << EN_PIN);
+	PORTB &= ~(1 << EN_PIN);
+}
+
+void stepper_enable(uint8_t enable) {
+	if (enable) {
+		PORTB |= (1 << EN_PIN);
+		} else {
+		PORTB &= ~(1 << EN_PIN);
+	}
 }
 
 /************************************************************************/
-/*			Чтение ADC, для определения нажатой кнопки					*/
+/*          АЦП                                                         */
 /************************************************************************/
-uint16_t adc_read(uint8_t channel)
-{
-	ADMUX = (1 << REFS0) | (channel & 0x07);  // Выбор канала
-	ADCSRA |= (1 << ADSC);                    // Запуск преобразования
-	while (ADCSRA & (1 << ADSC));             // Ожидание завершения
+void adc_init() {
+	ADMUX = (1 << REFS0);
+	ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1);
+}
+
+uint16_t adc_read(uint8_t channel) {
+	ADMUX = (1 << REFS0) | (channel & 0x07);
+	ADCSRA |= (1 << ADSC);
+	while (ADCSRA & (1 << ADSC));
 	return ADC;
 }
 
-/************************************************************************/
-/*			Распознование нажатой кнопки                                */
-/************************************************************************/
-uint8_t read_key()
-{
+uint8_t read_key() {
 	uint16_t adc_val = adc_read(KEY_ADC);
-	
-	if (adc_val < 50)      return 1;  // Right
-	else if (adc_val < 150) return 2;  // Up
-	else if (adc_val < 300) return 3;  // Down
-	else if (adc_val < 500) return 4;  // Left
-	else if (adc_val < 700) return 5;  // Select
-	else                   return 0;  // Нет нажатия
+
+	if (adc_val < 50)        return 1;
+	else if (adc_val < 150)  return 2;
+	else if (adc_val < 300)  return 3;
+	else if (adc_val < 500)  return 4;
+	else if (adc_val < 700)  return 5;
+	else                    return 0;
 }
 
-/************************************************************************/
-/*          Антидребезг и обработка длинных нажатий                     */
-/************************************************************************/
-uint8_t debounced_read_key()
-{
-	static uint16_t last_key = 0;
+uint8_t debounced_read_key() {
+	static uint8_t last_key = 0;
 	uint8_t key = read_key();
-	
+
 	if (key == last_key) {
-		return key;  // Кнопка удерживается
+		return key;
 		} else {
-		_delay_ms(50);  // Задержка для подавления дребезга
+		_delay_ms(50);
 		last_key = read_key();
 		return last_key;
 	}
 }
-/************************************************************************/
-/*          Быстрый импульс на EN                                       */
-/************************************************************************/
-void lcd_strobe()
-{
-	PORTB |= (1 << LCD_EN);
-	_delay_us(1);          // Импульс >450 нс
-	PORTB &= ~(1 << LCD_EN);
-	_delay_us(100);        // Пауза между командами
-}
 
 /************************************************************************/
-/*          Отправка 4 бит (ниббла)                                     */
+/*          LCD функции                                                 */
 /************************************************************************/
-void lcd_send_nibble(uint8_t data)
-{
-	// Записываем в PORTD (D4-D7)
-	PORTD = (PORTD & 0x0F) | (data << 4);
+void lcd_strobe() {
+	PORTB |= (1 << LCD_EN);
+	_delay_us(1);
+	PORTB &= ~(1 << LCD_EN);
+	_delay_us(100);
+}
+
+void lcd_send_nibble(uint8_t data) {
+	PORTD = (PORTD & 0x0F) | ((data & 0x0F) << 4);
 	lcd_strobe();
 }
 
-/************************************************************************/
-/*          Отправка команды (RS = 0)                                   */
-/************************************************************************/
-void lcd_command(uint8_t cmd)
-{
-	PORTB &= ~(1 << LCD_RS);  // RS = 0 (команда)
-	lcd_send_nibble(cmd >> 4);  // Старший ниббл
-	lcd_send_nibble(cmd & 0x0F); // Младший ниббл
-	if (cmd == 0x01 || cmd == 0x02) _delay_ms(2);  // Очистка/возврат дома
+void lcd_command(uint8_t cmd) {
+	PORTB &= ~(1 << LCD_RS);
+	lcd_send_nibble(cmd >> 4);
+	lcd_send_nibble(cmd & 0x0F);
+	if (cmd == LCD_CLEAR || cmd == LCD_RETURN_HOME) _delay_ms(2);
 }
 
-/************************************************************************/
-/*          Отправка данных (RS = 1)                                    */
-/************************************************************************/
-void lcd_data(uint8_t data)
-{
-	PORTB |= (1 << LCD_RS);  // RS = 1 (данные)
+void lcd_data(uint8_t data) {
+	PORTB |= (1 << LCD_RS);
 	lcd_send_nibble(data >> 4);
 	lcd_send_nibble(data & 0x0F);
 	_delay_us(100);
 }
 
-/************************************************************************/
-/*          Инициализация LCD                                           */
-/************************************************************************/
-void lcd_init()
-{
-	// 1. Настройка пинов на выход
+void lcd_backlight(uint8_t on) {
+	if (on) PORTB |= (1 << LCD_LIGHT);
+	else    PORTB &= ~(1 << LCD_LIGHT);
+}
+
+void lcd_init() {
 	DDRB |= (1 << LCD_RS) | (1 << LCD_EN) | (1 << LCD_LIGHT);
 	DDRD |= (1 << LCD_D4) | (1 << LCD_D5) | (1 << LCD_D6) | (1 << LCD_D7);
-	
-	PORTB |= (1 << LCD_D7)| (1 << LCD_LIGHT);
-	
-	// 2. Ждём стабилизации питания (>15 мс)
+
+	lcd_backlight(1);
 	_delay_ms(50);
 
-	// 3. Последовательность сброса (по даташиту HD44780)
-	PORTB &= ~(1 << LCD_RS);  // RS = 0 (команда)
-	
-	// 3.1 Первая попытка (8-битный режим)
+	PORTB &= ~(1 << LCD_RS);
 	lcd_send_nibble(0x03);
-	_delay_ms(5);  // Ждём 5 мс
-
-	// 3.2 Вторая попытка
-	lcd_send_nibble(0x03);
-	_delay_us(100);  // Ждём 100 мкс
-
-	// 3.3 Третья попытка
+	_delay_ms(5);
 	lcd_send_nibble(0x03);
 	_delay_us(100);
-
-	// 4. Переход в 4-битный режим
+	lcd_send_nibble(0x03);
+	_delay_us(100);
 	lcd_send_nibble(0x02);
 	_delay_us(100);
 
-	// 5. Функциональная настройка
-	lcd_command(0x28);  // 4-бит, 2 строки, шрифт 5x8
-	lcd_command(0x0C);  // Дисплей ON, курсор OFF
-	lcd_command(0x06);  // Автоинкремент курсора
-	lcd_command(0x01);  // Очистка дисплея
-	_delay_ms(2);       // Ждём завершения
+	lcd_command(LCD_FUNCTION_SET);
+	lcd_command(LCD_DISPLAY_ON);
+	lcd_command(LCD_ENTRY_MODE);
+	lcd_command(LCD_CLEAR);
+	_delay_ms(2);
 }
 
-/************************************************************************/
-/*           Вывод строки                                               */
-/************************************************************************/
-void lcd_print(const char *str)
-{
-	while (*str)
-	{
+void lcd_print(const char *str) {
+	while (*str) {
 		lcd_data(*str++);
 	}
 }
 
-/************************************************************************/
-/*      Конвертация числа в строку для вывода на LCD                    */
-/************************************************************************/
-char* int_to_str(int32_t num)
-{
+char* int_to_str(int32_t num) {
 	static char buf[12];
-	sprintf(buf,"%ld", num);
+	sprintf(buf, "%ld", num);
 	return buf;
 }
 
-
-
 /************************************************************************/
-/*      Пример использования                                            */
+/*          MAIN                                                        */
 /************************************************************************/
 int main() {
-	lcd_init();      // Инициализация LCD
-	adc_init();      // Инициализация АЦП
+	lcd_init();
+	adc_init();
+	stepper_init();
+	stepper_enable(1);
+	timer1_init();
+	sei();
 
 	lcd_print("Press any button");
 	_delay_ms(1000);
 
-	while (1) {
-		uint8_t key = read_key();
-		lcd_command(0x01);  // Очистка дисплея
+	uint8_t prev_key = 0;
 
-		switch (key) {
-			case 1: lcd_print("Right"); break;
-			case 2: lcd_print("Up"); break;
-			case 3: lcd_print("Down"); break;
-			case 4: lcd_print("Left"); break;
-			case 5: lcd_print("Select"); break;
-			default: lcd_print("No key"); break;
+	while (1) {
+		uint8_t key = debounced_read_key();
+
+		if (key != prev_key) {
+			lcd_command(LCD_CLEAR);
+
+			switch (key) {
+				case 1:
+				lcd_print("Right");
+				stepper_start_move(STEPS_TO_MOVE, 1);
+				break;
+				case 4:
+				lcd_print("Left");
+				stepper_start_move(STEPS_TO_MOVE, 0);
+				break;
+				case 2: lcd_print("Up"); break;
+				case 3: lcd_print("Down"); break;
+				case 5: lcd_print("Select"); break;
+				default: lcd_print("No key"); break;
+			}
+
+			prev_key = key;
 		}
-		
-		_delay_ms(200);  // Задержка для антидребезга
 	}
 }
