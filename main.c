@@ -5,7 +5,7 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <util/delay.h>
-
+#include <stdio.h>
 /************************************************************************/
 /*          Настройка пинов                                             */
 /************************************************************************/
@@ -17,11 +17,14 @@
 #define LCD_RS      PB0  // {LCD}	D8  (Register Select)
 #define LCD_EN      PB1  // {LCD}	D9  (Enable)
 #define LCD_LIGHT   PB2  // {LCD}	D10 (Enable) 
-#define DIR_PIN     PB3  // {MOTOR} D11
-#define STEP_PIN    PB4  // {MOTOR}	D12
-#define ENA_PIN     PB5  // {MOTOR} D13
+//#define DIR_PIN     PB3  // {MOTOR} D11
+//#define STEP_PIN    PB4  // {MOTOR}	D12
+//#define ENA_PIN     PB5  // {MOTOR} D13
 
 #define KEY_ADC     PC0  // Аналоговый вход A0
+
+
+char buffer[10];
 
 
 void adc_init();//Инициализация ADC
@@ -157,7 +160,7 @@ void lcd_init()
 	DDRB |= (1 << LCD_RS) | (1 << LCD_EN) | (1 << LCD_LIGHT);
 	DDRD |= (1 << LCD_D4) | (1 << LCD_D5) | (1 << LCD_D6) | (1 << LCD_D7);
 	
-	PORTB |= (1 << LCD_D7);
+	PORTB |= (1 << LCD_D7)| (1 << LCD_LIGHT);
 	
 	// 2. Ждём стабилизации питания (>15 мс)
 	_delay_ms(50);
@@ -206,167 +209,35 @@ void lcd_print(const char *str)
 char* int_to_str(int32_t num)
 {
 	static char buf[12];
-	itoa(num, buf, 10);
+	sprintf(buf,"%ld", num);
 	return buf;
 }
 
-/************************************************************************/
-/*       Инициализация таймера (Timer1)                                 */
-/************************************************************************/
-// 
-void timer1_init()
-{
-	TCCR1A = 0;                 // Normal port operation
-	TCCR1B = (1 << WGM12)       // CTC mode
-	| (1 << CS11);       // Prescaler 8 (0.5us при 16MHz)
-	TIMSK1 = (1 << OCIE1A);     // Enable compare match interrupt
-}
 
-/************************************************************************/
-/*       Инициализация драйвера                                         */
-/************************************************************************/
-void motor_init()
-{
-	DDRB |= (1 << ENA_PIN) | (1 << DIR_PIN) | (1 << STEP_PIN);
-	PORTB |= (1 << ENA_PIN);    // Двигатель выключен по умолчанию
-	timer1_init();
-}
-
-/************************************************************************/
-/*       Прерывание для генерации STEP импульсов                        */
-/************************************************************************/
-ISR(TIMER1_COMPA_vect)
-{
-	static uint16_t accel_counter = 0;
-	static uint8_t step_phase = 0;
-	
-	if (target_steps != 0)
-	{
-		if (step_phase == 0)
-		{
-			// Генерация импульса STEP
-			PORTB |= (1 << STEP_PIN);
-			step_phase = 1;
-			
-			// Обновление позиции
-			if (target_steps > 0)
-			{
-				current_position++;
-				target_steps--;
-			}
-			else
-			{
-				current_position--;
-				target_steps++;
-			}
-		}
-		else
-		{
-			PORTB &= ~(1 << STEP_PIN);
-			step_phase = 0;
-			
-			// Адаптивное изменение скорости
-			accel_counter++;
-			if (accel_counter > 50)
-			{  // Каждые 50 шагов
-				accel_counter = 0;
-				
-				// Разгон в начале движения
-				if (abs(target_steps) > (abs(target_steps) + current_position)/3)
-				{
-					if (step_delay > MIN_DELAY) step_delay -= 2;
-				}
-				// Торможение в конце движения
-				else
-				{
-					if (step_delay < MAX_DELAY) step_delay += 5;
-				}
-			}
-		}
-		
-		OCR1A = step_delay;  // Установка новой скорости
-	}
-}
-
-/************************************************************************/
-/*       Функция перемещения                                            */
-/************************************************************************/
-void move_to_position(int32_t position)
-{
-	// Расчет необходимых шагов
-	target_steps = (position * MICROSTEPS) - current_position;
-	
-	// Установка направления
-	if (target_steps >= 0)
-	{
-		PORTB |= (1 << DIR_PIN);
-	}
-	else
-	{
-		PORTB &= ~(1 << DIR_PIN);
-	}
-	
-	// Включение драйвера
-	//PORTB &= ~(1 << ENA_PIN);
-	PORTB |= (1 << ENA_PIN);
-	// Сброс параметров движения
-	step_delay = MAX_DELAY;
-	movement_flags = 0;
-	
-	// Ждем завершения движения
-	while (target_steps != 0);
-	
-	// Выключение драйвера (опционально)
-	// PORTB |= (1 << ENA_PIN);
-}
-
-/************************************************************************/
-/*      Быстрое перемещение без плавного разгона                        */
-/************************************************************************/
-void move_immediate(int32_t steps)
-{
-	target_steps = steps * MICROSTEPS;
-	step_delay = MIN_DELAY;
-	
-	if (steps >= 0)
-	{
-		PORTB |= (1 << DIR_PIN);
-	}
-	else
-	{
-		PORTB &= ~(1 << DIR_PIN);
-	}
-	
-	PORTB &= ~(1 << ENA_PIN);
-	while (target_steps != 0);
-}
 
 /************************************************************************/
 /*      Пример использования                                            */
 /************************************************************************/
-int main()
-{
-	lcd_init();
-	 lcd_print("Hello, HD44780!");
-	 lcd_command(0xC0);  // Переход на 2-ю строку
-	 lcd_print("RS=PB0, EN=PB1");
-	 
-	motor_init();
-	sei();  // Разрешить прерывания
-	
-	// Конфигурация пинов кнопок (должна быть в отдельном файле)
-	// buttons_init();
-	
-	while(1)
-	{
-		// Пример движения:
-		move_to_position(1600);  // 1 оборот (200*8 микрошагов)
-		_delay_ms(500);
-		move_to_position(0);     // Возврат в 0
-		_delay_ms(500);
+int main() {
+	lcd_init();      // Инициализация LCD
+	adc_init();      // Инициализация АЦП
+
+	lcd_print("Press any button");
+	_delay_ms(1000);
+
+	while (1) {
+		uint8_t key = read_key();
+		lcd_command(0x01);  // Очистка дисплея
+
+		switch (key) {
+			case 1: lcd_print("Right"); break;
+			case 2: lcd_print("Up"); break;
+			case 3: lcd_print("Down"); break;
+			case 4: lcd_print("Left"); break;
+			case 5: lcd_print("Select"); break;
+			default: lcd_print("No key"); break;
+		}
 		
-		// Здесь можно добавить обработку кнопок из отдельного файла
-		// uint8_t btn = read_button();
-		// if (btn == RIGHT_BTN) move_to_position(100);
+		_delay_ms(200);  // Задержка для антидребезга
 	}
 }
