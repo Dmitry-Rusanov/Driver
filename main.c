@@ -29,14 +29,17 @@
 #define LCD_ENTRY_MODE    0x06
 #define LCD_FUNCTION_SET  0x28
 
-#define STEPS_TO_MOVE 1000
-#define MIN_DELAY 100
-#define MAX_DELAY 800
+/************************************************************************/
+/*          Параметры редактирования                                    */
+/************************************************************************/
+volatile uint16_t step_count = 1000;   // Количество шагов
+volatile uint16_t step_speed = 200;    // Скорость в шагах/сек
+volatile uint8_t editing_mode = 0;
 
-char buffer[10];
+char buffer[16];
+
 volatile uint16_t steps_remaining = 0;
-volatile uint8_t step_dir = 0;
-volatile uint16_t step_delay = MAX_DELAY;
+volatile uint8_t step_dir = 0; // 1 - вправо, 0 - влево
 
 /************************************************************************/
 /*          Прототипы функций                                           */
@@ -53,57 +56,13 @@ void lcd_init();
 void lcd_print(const char *str);
 char* int_to_str(int32_t num);
 void lcd_backlight(uint8_t on);
+void update_lcd_display();
 
-void timer1_init() {
-	TCCR1B |= (1 << WGM12);
-	TIMSK1 |= (1 << OCIE1A);
-	OCR1A = ((F_CPU / 8) / (1000000 / step_delay)) - 1;
-	TCCR1B |= (1 << CS11);
-}
-
-ISR(TIMER1_COMPA_vect) {
-	if (steps_remaining > 0) {
-		if (step_dir)
-		PORTB |= (1 << DIR_PIN);
-		else
-		PORTB &= ~(1 << DIR_PIN);
-
-		PORTB |= (1 << STEP_PIN);
-		for (volatile uint8_t i = 0; i < 20; i++) __asm__ __volatile__("nop");
-		PORTB &= ~(1 << STEP_PIN);
-
-		steps_remaining--;
-
-		if (steps_remaining > 0) {
-			if (step_delay > MIN_DELAY && steps_remaining > 50) {
-				step_delay -= 5;
-				} else if (steps_remaining < 50 && step_delay < MAX_DELAY) {
-				step_delay += 5;
-			}
-			OCR1A = ((F_CPU / 8) / (1000000 / step_delay)) - 1;
-		}
-	}
-}
-
-void stepper_start_move(uint16_t steps, uint8_t dir) {
-	step_dir = dir;
-	steps_remaining = steps;
-	step_delay = MAX_DELAY;
-	OCR1A = ((F_CPU / 8) / (1000000 / step_delay)) - 1;
-}
-
-void stepper_init() {
-	DDRB |= (1 << STEP_PIN) | (1 << DIR_PIN) | (1 << EN_PIN);
-	PORTB &= ~(1 << EN_PIN);
-}
-
-void stepper_enable(uint8_t enable) {
-	if (enable) {
-		PORTB |= (1 << EN_PIN);
-		} else {
-		PORTB &= ~(1 << EN_PIN);
-	}
-}
+void stepper_init();
+void stepper_enable(uint8_t enable);
+void stepper_start_move(uint16_t steps, uint8_t dir);
+void timer1_init();
+void set_speed(uint16_t steps_per_sec);
 
 /************************************************************************/
 /*          АЦП                                                         */
@@ -122,19 +81,17 @@ uint16_t adc_read(uint8_t channel) {
 
 uint8_t read_key() {
 	uint16_t adc_val = adc_read(KEY_ADC);
-
-	if (adc_val < 50)        return 1;
-	else if (adc_val < 150)  return 2;
-	else if (adc_val < 300)  return 3;
-	else if (adc_val < 500)  return 4;
-	else if (adc_val < 700)  return 5;
-	else                    return 0;
+	if (adc_val < 50)         return 1;
+	else if (adc_val < 150)   return 2;
+	else if (adc_val < 300)   return 3;
+	else if (adc_val < 500)   return 4;
+	else if (adc_val < 700)   return 5;
+	else                      return 0;
 }
 
 uint8_t debounced_read_key() {
 	static uint8_t last_key = 0;
 	uint8_t key = read_key();
-
 	if (key == last_key) {
 		return key;
 		} else {
@@ -214,10 +171,71 @@ char* int_to_str(int32_t num) {
 	return buf;
 }
 
+void update_lcd_display() {
+	lcd_command(LCD_CLEAR);
+	if (editing_mode == 1) {
+		lcd_print("Edit Steps:");
+		} else if (editing_mode == 2) {
+		lcd_print("Edit Speed:");
+		} else {
+		lcd_print("Ready");
+	}
+	lcd_command(0xC0);
+	sprintf(buffer, "S:%u  V:%u", step_count, step_speed);
+	lcd_print(buffer);
+}
+
 /************************************************************************/
-/*          MAIN                                                        */
+/*          Шаговый двигатель                                           */
 /************************************************************************/
-int main() {
+void stepper_init() {
+	DDRB |= (1 << STEP_PIN) | (1 << DIR_PIN) | (1 << EN_PIN);
+	PORTB &= ~(1 << EN_PIN);
+}
+
+void stepper_enable(uint8_t enable) {
+	if (enable) {
+		PORTB |= (1 << EN_PIN);
+		} else {
+		PORTB &= ~(1 << EN_PIN);
+	}
+}
+
+void stepper_start_move(uint16_t steps, uint8_t dir) {
+	step_dir = dir;
+	steps_remaining = steps;
+}
+
+void set_speed(uint16_t steps_per_sec) {
+	if (steps_per_sec == 0) steps_per_sec = 1;
+	step_speed = steps_per_sec;
+	OCR1A = (F_CPU / 8 / step_speed) - 1;
+}
+
+void timer1_init() {
+	TCCR1B |= (1 << WGM12);
+	TIMSK1 |= (1 << OCIE1A);
+	set_speed(step_speed);
+	TCCR1B |= (1 << CS11);
+}
+
+ISR(TIMER1_COMPA_vect) {
+	if (steps_remaining > 0) {
+		if (step_dir)
+		PORTB |= (1 << DIR_PIN);
+		else
+		PORTB &= ~(1 << DIR_PIN);
+
+		PORTB |= (1 << STEP_PIN);
+		for (volatile uint8_t i = 0; i < 20; i++) {
+			__asm__ __volatile__("nop");
+		}
+		PORTB &= ~(1 << STEP_PIN);
+		steps_remaining--;
+	}
+}
+
+int main(void) {
 	lcd_init();
 	adc_init();
 	stepper_init();
@@ -227,31 +245,53 @@ int main() {
 
 	lcd_print("Press any button");
 	_delay_ms(1000);
+	update_lcd_display();
 
 	uint8_t prev_key = 0;
+	uint8_t last_select = 0;
 
 	while (1) {
 		uint8_t key = debounced_read_key();
 
-		if (key != prev_key) {
-			lcd_command(LCD_CLEAR);
-
-			switch (key) {
-				case 1:
-				lcd_print("Right");
-				stepper_start_move(STEPS_TO_MOVE, 1);
-				break;
-				case 4:
-				lcd_print("Left");
-				stepper_start_move(STEPS_TO_MOVE, 0);
-				break;
-				case 2: lcd_print("Up"); break;
-				case 3: lcd_print("Down"); break;
-				case 5: lcd_print("Select"); break;
-				default: lcd_print("No key"); break;
-			}
-
-			prev_key = key;
+		if (key == 5 && last_select == 0) {
+			editing_mode = (editing_mode + 1) % 3;
+			update_lcd_display();
 		}
+		last_select = (key == 5);
+
+		if (editing_mode == 0) {
+			if (key == 1) {
+				lcd_command(LCD_CLEAR);
+				lcd_print("Move Right");
+				stepper_start_move(step_count, 1);
+				} else if (key == 4) {
+				lcd_command(LCD_CLEAR);
+				lcd_print("Move Left");
+				stepper_start_move(step_count, 0);
+			}
+			} else {
+			if (key == 2) {
+				if (editing_mode == 1) {
+					step_count += 100;
+					} else if (editing_mode == 2) {
+					step_speed += 50;
+					set_speed(step_speed);
+				}
+				update_lcd_display();
+			}
+			if (key == 3) {
+				if (editing_mode == 1 && step_count >= 100) {
+					step_count -= 100;
+					} else if (editing_mode == 2 && step_speed > 50) {
+					step_speed -= 50;
+					set_speed(step_speed);
+				}
+				update_lcd_display();
+			}
+		}
+
+		_delay_ms(100);
+		prev_key = key;
 	}
+	return 0;
 }
