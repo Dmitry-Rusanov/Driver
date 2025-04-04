@@ -1,4 +1,7 @@
-
+/************************************************************************/
+/* https://robotchip.ru/obzor-lcd-modulya-keypad/ - LCD Board           */
+/* https://www.goldsupplier.com/provide/p140658198.html - UIM2400X      */                                                               
+/************************************************************************/
 
 #define F_CPU 16000000UL  // Например, для 16 МГц (указывайте свою частоту!)
 
@@ -42,20 +45,7 @@ char* int_to_str(int32_t num);//
 
 
 
-// Конфигурация пинов (Arduino Nano)
 
-
-// Параметры двигателя
-#define STEPS_PER_REV      200
-#define MICROSTEPS         16
-#define MIN_DELAY          20    // ~5000 шагов/сек (макс. скорость)
-#define MAX_DELAY          1000  // ~100 шагов/сек (начальная скорость)
-
-// Глобальные переменные
-volatile int32_t current_position = 0;
-volatile int32_t target_steps = 0;
-volatile uint16_t step_delay = MAX_DELAY;
-volatile uint8_t movement_flags = 0;
 
 /************************************************************************/
 /*			Инициализация ADC                                           */
